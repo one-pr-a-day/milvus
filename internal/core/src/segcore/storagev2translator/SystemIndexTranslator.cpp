@@ -174,35 +174,48 @@ TimestampIndexTranslator::get_cells(
     CheckCancellation(
         ctx, segment_id_, "TimestampIndexTranslator::get_cells()");
 
-    // Pin column chunks temporarily to build the TimestampIndex, then release.
-    // TimestampIndexCell intentionally does NOT hold raw timestamp data or
-    // pins to GroupChunk cells — callers read raw timestamps by pinning the
-    // timestamp column directly. This avoids a DList deadlock where evicting
-    // this cell would unpin GroupChunk cells under the same list_mtx_.
-    auto all_chunks = column_->GetAllChunks(ctx);
-    TimestampIndex index;
-    if (all_chunks.size() == 1) {
-        auto* fixed_chunk = static_cast<FixedWidthChunk*>(all_chunks[0].get());
-        auto span = fixed_chunk->Span();
-        auto* ts_ptr = static_cast<const Timestamp*>(span.data());
-        if (!(static_cast<int64_t>(span.row_count()) == num_rows_)) {
-            ThrowInfo(ErrorCode::DataFormatBroken,
-                      "timestamp chunk row count {} != expected {}",
-                      span.row_count(),
-                      num_rows_);
+    const bool is_vortex = column_->GetLocalFormat() ==
+                           ChunkedColumnInterface::LocalFormat::Vortex;
+    std::vector<PinWrapper<Chunk*>> all_chunks;
+    if (!is_vortex) {
+        // Preserve the original batched cold load and pin lifetime for Raw.
+        all_chunks = column_->GetAllChunks(ctx);
+    }
+    const auto visit_span = [&](int64_t chunk_id, const auto& visitor) {
+        if (is_vortex) {
+            auto pin = column_->Span(ctx, chunk_id);
+            visitor(pin.get());
+            return;
         }
-        index = build_timestamp_index(ts_ptr, num_rows_);
+        auto* fixed_chunk =
+            static_cast<FixedWidthChunk*>(all_chunks[chunk_id].get());
+        visitor(fixed_chunk->Span());
+    };
+
+    TimestampIndex index;
+    if (column_->num_chunks() == 1) {
+        visit_span(0, [&](const auto& span) {
+            auto* ts_ptr = static_cast<const Timestamp*>(span.data());
+            if (!(static_cast<int64_t>(span.row_count()) == num_rows_)) {
+                ThrowInfo(ErrorCode::DataFormatBroken,
+                          "timestamp chunk row count {} != expected {}",
+                          span.row_count(),
+                          num_rows_);
+            }
+            index = build_timestamp_index(ts_ptr, num_rows_);
+        });
     } else {
         std::vector<Timestamp> temp(num_rows_);
         size_t offset = 0;
-        for (auto& pin : all_chunks) {
-            auto* fixed_chunk = static_cast<FixedWidthChunk*>(pin.get());
-            auto span = fixed_chunk->Span();
-            milvus::fastmem::FastMemcpy(
-                temp.data() + offset,
-                static_cast<const Timestamp*>(span.data()),
-                span.row_count() * sizeof(*temp.data()));
-            offset += span.row_count();
+        for (int64_t chunk_id = 0; chunk_id < column_->num_chunks();
+             ++chunk_id) {
+            visit_span(chunk_id, [&](const auto& span) {
+                milvus::fastmem::FastMemcpy(
+                    temp.data() + offset,
+                    static_cast<const Timestamp*>(span.data()),
+                    span.row_count() * sizeof(*temp.data()));
+                offset += span.row_count();
+            });
         }
         if (!(static_cast<int64_t>(offset) == num_rows_)) {
             ThrowInfo(ErrorCode::DataFormatBroken,
